@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Pytest / coverage
+.pytest_cache/
+.tox/
+htmlcov/
+.coverage
+coverage.xml
+
+# Logs (session-specific run output)
+*.log
+v6_*_log.txt
+
+# IDE / tool state
+.claude/
+.idea/
+*.swp
+*.swo
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# Checkpoint files written during long evaluation runs
+*_checkpoint.json

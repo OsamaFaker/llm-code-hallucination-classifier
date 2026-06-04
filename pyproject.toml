@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hallucination-detector"
+version = "6.0.0"
+description = "Static-plus-semantic pipeline for detecting hallucinations in LLM-generated Python code"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+dependencies = [
+    "pydantic>=2.0",
+    "numpy>=1.21",
+    "scipy>=1.7",
+]
+
+[project.optional-dependencies]
+viz = [
+    "matplotlib>=3.5",
+]
+semantic = [
+    "transformers>=4.20",
+    "torch>=1.12",
+    "sentence-transformers>=2.2",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+classify = "classify_unclassified_v6:run"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.pyright]
+# Project root is the import root; src.* imports resolve from here.
+extraPaths = ["."]
+venvPath = "."
+venv = ".venv"
