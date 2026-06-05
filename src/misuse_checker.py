@@ -1,9 +1,20 @@
 """
 Misuse / Composition Checker Plugin.
 
-Detects grounded errors: valid APIs used with wrong argument types,
-invalid domains, type mismatches, and parameter errors.
-Integrates with the Type Inference Engine for generalized type checking.
+Applies the GT-existence framework to API call composition:
+
+  GROUNDED_ERROR — the construct exists in the Python Ground Truth but is
+    used incorrectly: wrong argument type, invalid domain value, or calling
+    a real parameter with a bad value.
+    Examples: math.sqrt(-1), range("5"), open(f, 'invalid'), append() with
+    no argument.
+
+  HALLUCINATION — a construct is invoked that has no referent in the Python
+    Ground Truth: a keyword argument name that does not appear in the
+    function's known parameter list is a fabricated parameter.
+    Example: open(f, base=10) — 'base' is not a parameter of open().
+
+Integrates with the Type Inference Engine for generalised type checking.
 """
 from typing import List, Optional
 from src.models import ClassificationResult, HallucinationCategory, SeverityLevel
@@ -13,7 +24,12 @@ from src.type_inference import run_type_inference
 
 
 class MisuseCheckerPlugin(CheckerPlugin):
-    """Detects grounded errors: valid APIs used incorrectly."""
+    """
+    Classifies API composition errors using the GT-existence framework.
+
+    GROUNDED_ERROR: construct exists in GT, used with wrong value/type.
+    HALLUCINATION:  construct (parameter name) does not exist in GT.
+    """
 
     @property
     def name(self) -> str:
@@ -63,17 +79,19 @@ def verify_composition(extracted_calls: List[dict], gt: GroundTruthRegistry, cod
 
         valid_params = gt.get_params(module, method)
 
-        # Phantom Default Value / Parameter Name Check (Item #5):
-        # Applies to ALL GT-known functions via gt.get_params().
-        # If a kwarg name is not in the known parameter list, it is fabricated.
+        # GT-existence check on keyword argument names (Item #5).
+        # A kwarg name that does not appear in the function's GT parameter list
+        # has no referent in the execution environment → HALLUCINATION (PARAMETER).
+        # Contrast: a kwarg that exists but receives a wrong value (e.g. reverse='yes')
+        # → GROUNDED_ERROR (construct exists, usage is wrong).
         if valid_params is not None:
             for kwarg in kwargs:
                 if kwarg not in valid_params:
                     return ClassificationResult(
-                        is_valid=False, is_grounded_error=True, hallucination_category=None,
-                        explanation=f"Grounded Error: Invalid keyword argument '{kwarg}' in {module}.{method}().",
+                        is_valid=False, is_grounded_error=False, hallucination_category=HallucinationCategory.PARAMETER,
+                        explanation=f"Hallucination: Fabricated keyword argument '{kwarg}' in {module}.{method}().",
                         confidence=0.95,
-                        severity=SeverityLevel.MEDIUM,
+                        severity=SeverityLevel.HIGH,
                         checker_source="misuse",
                         line=call.get('line'),
                         bad_token=kwarg

@@ -4,8 +4,18 @@ Phantom Attribute Checker Plugin (Item #2).
 Detects hallucinated attributes/methods on well-known Python built-in types
 by comparing AST attribute accesses against `dir(type)` via runtime introspection.
 
-Addresses Condition 3: the LLM invokes an entity (e.g. `list.first`, `str.pad`,
-`dict.filter`) that has no formal referent in the execution environment.
+Classification principle (GT-existence framework):
+  - Construct EXISTS in Python Ground Truth → GROUNDED_ERROR if misused.
+    Example: `numbers.append()` — append exists on list but is called without
+    its required argument.  The error is grounded in a real construct.
+  - Construct does NOT exist in Python Ground Truth → HALLUCINATION.
+    Example: `numbers.add(5)` — add does not exist on list regardless of
+    whether it exists on set; `list.push(x)` — push does not exist in Python
+    regardless of JavaScript.  Both are fabricated attributes on this type.
+
+This checker handles the HALLUCINATION branch for attribute access.
+The GROUNDED_ERROR branch (bound-method-no-call) is handled separately
+in `_check_bound_method_no_call` below.
 """
 import ast
 from typing import Optional, Dict, Set
@@ -179,9 +189,9 @@ def _check_phantom_attributes(code: str, tree: 'ast.AST | None' = None) -> Optio
         if attr not in valid_attrs:
             line_info = f" (line {node.lineno})" if hasattr(node, "lineno") else ""
 
-            # Cross-type check: does this attr exist on any OTHER known type?
-            # If yes -> type confusion: right method, wrong type -> Condition 2 (Grounded Error)
-            # If no  -> fabricated attribute: doesn't exist anywhere -> Condition 3 (Hallucination)
+            # GT-existence check: the attribute does not exist on this type.
+            # Regardless of whether it exists on another type or in another language,
+            # it has no formal referent on this object → HALLUCINATION in all sub-cases.
             exists_on_other_type = any(
                 attr in (_get_valid_attrs(other) or set())
                 for other in _TYPE_MAP
@@ -193,12 +203,12 @@ def _check_phantom_attributes(code: str, tree: 'ast.AST | None' = None) -> Optio
                 other_types = [t for t in _TYPE_MAP if t != obj_type and attr in (_get_valid_attrs(t) or set())]
                 return ClassificationResult(
                     is_valid=False,
-                    is_grounded_error=True,
-                    hallucination_category=None,
+                    is_grounded_error=False,
+                    hallucination_category=HallucinationCategory.ATTRIBUTE,
                     explanation=(
-                        f"Grounded Error: '{obj_type}.{attr}' does not exist{line_info}. "
+                        f"Hallucination: '{obj_type}.{attr}' does not exist{line_info}. "
                         f"'{attr}' is a valid method of {other_types} but not of {obj_type} "
-                        f"(type confusion — right method, wrong type)."
+                        f"(fabricated attribute on this type)."
                     ),
                     confidence=0.91,
                     severity=SeverityLevel.HIGH,
@@ -208,16 +218,16 @@ def _check_phantom_attributes(code: str, tree: 'ast.AST | None' = None) -> Optio
                 )
             elif attr in _CROSS_LANGUAGE_METHODS:
                 # e.g. list.push, list.isEmpty — valid in JS/Java but not Python.
-                # This is cross-language API confusion → Condition 2 (Grounded Error).
+                # This is cross-language API confusion → Condition 3 (Hallucination).
                 return ClassificationResult(
                     is_valid=False,
-                    is_grounded_error=True,
-                    hallucination_category=None,
+                    is_grounded_error=False,
+                    hallucination_category=HallucinationCategory.ATTRIBUTE,
                     explanation=(
-                        f"Grounded Error: '{obj_type}.{attr}' does not exist{line_info}. "
+                        f"Hallucination: '{obj_type}.{attr}' does not exist{line_info}. "
                         f"'{attr}' is a valid method in other languages (e.g. JavaScript/Java) "
                         f"but not in Python's built-in {obj_type} type "
-                        f"(cross-language API confusion)."
+                        f"(fabricated attribute on this type)."
                     ),
                     confidence=0.89,
                     severity=SeverityLevel.HIGH,
@@ -246,9 +256,11 @@ def _check_phantom_attributes(code: str, tree: 'ast.AST | None' = None) -> Optio
 
 
 # ---------------------------------------------------------------------------
-# Cross-language methods: valid in other languages but not Python built-ins.
-# When an LLM calls list.push() or dict.contains(), it's a cross-language
-# API confusion — Condition 2 (Grounded Error), not a fabrication.
+# Cross-language methods: valid in other languages but absent from Python built-ins.
+# When an LLM calls list.push() or dict.contains(), the attribute does not exist
+# in the Python Ground Truth for that type → HALLUCINATION (fabricated attribute),
+# not a Grounded Error.  The fact that push() exists in JavaScript is irrelevant
+# to whether it has a referent in the Python execution environment.
 # ---------------------------------------------------------------------------
 _CROSS_LANGUAGE_METHODS: frozenset = frozenset({
     # JavaScript Array / Java ArrayList equivalents used on Python lists

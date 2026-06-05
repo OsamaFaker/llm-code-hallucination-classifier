@@ -4,20 +4,28 @@ import importlib
 import builtins
 from typing import Optional, Set, Dict, Any
 from src.plugin_registry import CheckerPlugin
-from src.models import ClassificationResult, SeverityLevel
+from src.models import ClassificationResult, HallucinationCategory, SeverityLevel
 
 # Safe-import allowlist: standard library and prototype-used modules
 SAFE_MODULES: Set[str] = {
-    "os", "sys", "json", "math", "datetime", "re", "collections", 
-    "itertools", "functools", "pathlib", "random", "time", "urllib", 
+    "os", "sys", "json", "math", "datetime", "re", "collections",
+    "itertools", "functools", "pathlib", "random", "time", "urllib",
     "hashlib", "base64", "csv", "tempfile", "shutil", "glob", "io",
     "pickle", "inspect", "ast", "typing"
 }
 
 class SignatureCheckerPlugin(CheckerPlugin):
     """
-    Static checker that introspects runtime signatures of builtins and stdlib 
-    functions to catch keyword-argument mismatches and unbound callable assignments.
+    Static checker that introspects runtime signatures of builtins and stdlib
+    functions to catch argument errors, applying the GT-existence framework:
+
+    HALLUCINATION — keyword argument name does not exist in the function's
+      Ground Truth signature (unexpected keyword argument).
+      Example: open("f", base=10) — 'base' is fabricated.
+
+    GROUNDED_ERROR — the function exists and the parameter structure is known,
+      but the call violates the arity or positional-argument rules.
+      Example: pow(2, 3, 4, 5) — too many positional arguments.
     """
 
     @property
@@ -47,10 +55,14 @@ class SignatureCheckerPlugin(CheckerPlugin):
         visitor.visit(ast_tree)
 
         if visitor.found_error:
+            # GT-existence split: an unexpected keyword argument is a fabricated
+            # parameter (HALLUCINATION); any other signature violation (wrong arity,
+            # missing required arg) is a real construct used incorrectly (GROUNDED_ERROR).
+            is_fake_kwarg = "unexpected keyword argument" in visitor.found_error
             return ClassificationResult(
                 is_valid=False,
-                is_grounded_error=True,
-                hallucination_category=None,
+                is_grounded_error=not is_fake_kwarg,
+                hallucination_category=HallucinationCategory.PARAMETER if is_fake_kwarg else None,
                 explanation=visitor.found_error,
                 confidence=0.98,
                 severity=SeverityLevel.HIGH,
