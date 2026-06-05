@@ -22,9 +22,11 @@ htmlcov/
 .coverage
 coverage.xml
 
-# Logs (session-specific run output)
+# Logs — exclude root-level session logs; keep results/ runtime logs
 *.log
 v6_*_log.txt
+!results/*.log
+!results/v6_*_log.txt
 
 # IDE / tool state
 .claude/
