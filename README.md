@@ -137,16 +137,44 @@ TRUE HALLUCINATION     0                0             150
 
 ### Llama 3 8B
 
+**Overall accuracy: 0.938 · Macro F1: 0.938**
+
+| Class | Precision | Recall | F1 |
+|---|---|---|---|
+| VALID | 1.000 | 0.940 | 0.969 |
+| GROUNDED_ERROR | 0.963 | 0.873 | 0.916 |
+| HALLUCINATION | 0.867 | 1.000 | 0.929 |
+
+Confusion matrix (rows = true label, columns = predicted):
+
+```
+                   VALID   GROUNDED_ERROR   HALLUCINATION
+TRUE VALID           141                5               4
+TRUE GROUNDED_ERROR    0              131              19
+TRUE HALLUCINATION     0                0             150
+```
+
 *Results file:* `results/mbpp_oracle_450_llama3_results.json`
 
-> Results will be added here once the run completes.
+### Model comparison
+
+| Metric | Qwen 2.5 Coder 7B | Llama 3 8B |
+|---|---|---|
+| Overall accuracy | 0.907 | **0.938** |
+| Macro F1 | 0.907 | **0.938** |
+| VALID F1 | 0.958 | **0.969** |
+| GROUNDED_ERROR F1 | 0.873 | **0.916** |
+| HALLUCINATION F1 | 0.890 | **0.929** |
+| HALLUCINATION recall | 1.000 | 1.000 |
+| VALID precision | 1.000 | 1.000 |
 
 ### Key observations
 
-- **HALLUCINATION recall = 1.00** for Qwen — the pipeline never misses a hallucination
-- **VALID precision = 1.00** for Qwen — every sample it calls VALID truly passes all tests
-- **Main confusion**: 30 GROUNDED_ERROR samples are over-called as HALLUCINATION (20%) — the hardest boundary in the taxonomy
-- The old 60-sample dataset (85% HALLUCINATION) reported a misleading 95% accuracy; the **balanced 450-sample evaluation gives a more honest 90.7%**
+- **Both models achieve 100% HALLUCINATION recall** — the pipeline never misses a hallucination
+- **Both models achieve 100% VALID precision** — when either calls a sample VALID, it truly passes all tests
+- **Llama 3 outperforms Qwen** on this balanced dataset: 93.8% vs 90.7% accuracy
+- **Main confusion in both models**: GROUNDED_ERROR samples over-called as HALLUCINATION (the hardest boundary in the taxonomy) — 30 cases for Qwen, 19 for Llama 3
+- The old 60-sample dataset (85% HALLUCINATION skew) reported a misleading 95% accuracy; the **balanced 450-sample evaluation gives a more honest picture**
 
 ---
 
