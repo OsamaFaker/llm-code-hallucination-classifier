@@ -19,6 +19,56 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from src.dataset import CodeSample
 from src.classifier import CodeClassifier
+from src.models import ClassificationResult, HallucinationCategory
+
+
+def _oracle_post_verify(
+    result: ClassificationResult,
+    code: str,
+    test_assertions: str,
+    timeout: int = 5,
+) -> ClassificationResult:
+    """
+    Run the oracle executor against test assertions and override a VALID
+    result if execution fails.  Called after static + LLM verification
+    to catch false negatives that neither checker detected.
+    """
+    from src.oracle_executor import (
+        execute_code,
+        LABEL_VALID,
+        LABEL_HALLUCINATION,
+    )
+    exec_label, error_msg, exc_type = execute_code(code, test_assertions, timeout=timeout)
+
+    if exec_label == LABEL_VALID:
+        return result
+
+    result.oracle_exec_label = exec_label
+    result.oracle_exec_error = error_msg
+
+    if exec_label == LABEL_HALLUCINATION:
+        result.is_valid = False
+        result.is_grounded_error = False
+        result.hallucination_category = HallucinationCategory.FUNCTION
+        result.checker_source = "oracle_exec"
+        result.explanation = (
+            f"Oracle execution revealed hallucination "
+            f"({exc_type}: {error_msg[:120]})"
+        )
+    else:
+        result.is_valid = False
+        result.is_grounded_error = True
+        result.hallucination_category = None
+        result.checker_source = "oracle_exec"
+        result.explanation = (
+            f"Oracle execution revealed grounded error "
+            f"({exc_type or 'AssertionError'}: {error_msg[:120]})"
+        )
+
+    exp = result.explanation
+    result.short_explanation = (exp[:97] + "...") if len(exp) > 100 else exp
+    return result
+
 
 # Supported model aliases → Ollama model identifiers
 MODEL_MAP = {
@@ -89,6 +139,14 @@ def parse_args() -> argparse.Namespace:
             "Number of parallel LLM-verifier workers (default: 3). "
             "Fewer workers reduce memory pressure; more may improve throughput "
             "when sufficient RAM is available."
+        ),
+    )
+    parser.add_argument(
+        "--input",
+        default=None,
+        help=(
+            "Override the input dataset JSON path. "
+            "Default: dataset_v4_500_unclassified.json"
         ),
     )
     return parser.parse_args()
@@ -181,7 +239,7 @@ def run() -> None:
     model_id = MODEL_MAP[args.model]
     output_file = args.output or f"dataset_v4_500_classified_v6_{args.model}.json"
     workers = args.workers
-    input_file = "dataset_v4_500_unclassified.json"
+    input_file = args.input or "dataset_v4_500_unclassified.json"
 
     # Task 5: fail loudly before any work if the model is absent
     check_model_present(model_id)
@@ -237,8 +295,13 @@ def run() -> None:
 
     print(f"Static Funnel done. {len(to_verify)} samples need LLM verification.")
 
-    # Phase 2: Parallel LLM Verifier
+    # Phase 2: Parallel LLM Verifier + optional oracle post-verification
     print(f"\nPhase 2: Parallel Verifier Dispatch (Workers={workers})...")
+
+    # Detect whether the dataset carries test assertions (oracle dataset format).
+    has_tests = any(s.get("tests") for s in samples)
+    if has_tests:
+        print("  [oracle] Test assertions detected — will run oracle executor on VALID samples.")
 
     call_latencies: dict = {}
     error_count = 0
@@ -249,6 +312,14 @@ def run() -> None:
         try:
             result = classifier.verify_semantic(cs, s_res)
             latency_ms = (time.perf_counter() - t0) * 1000
+
+            # Oracle post-verification: execute code against test assertions to
+            # catch false negatives that the LLM verifier passed through.
+            if result.is_valid and has_tests:
+                test_assertions = samples[idx].get("tests", "")
+                if test_assertions:
+                    result = _oracle_post_verify(result, cs.generated_code, test_assertions)
+
             return idx, result, latency_ms, False
         except Exception as e:
             latency_ms = (time.perf_counter() - t0) * 1000

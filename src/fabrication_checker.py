@@ -186,8 +186,16 @@ def verify_fabrication(extracted_calls: List[dict], extracted_imports: List[dict
                         bad_token=val
                     )
 
-        # Expand allowed builtins to avoid false positives on valid logic
-        safe_modules = ('builtins', 'builtins.str', 'math', 'sys', 'os', 'collections', 'itertools', 're', 'functools', 'datetime', 'json', 'random', 'typing', 'subprocess', 'time', '__main__')
+        # Expand allowed builtins to avoid false positives on valid logic.
+        # Built-in types (set, list, dict, …) appear as module names when the
+        # parser extracts chained calls like set(x).intersection(y).
+        import builtins as _builtins
+        _builtin_names = frozenset(dir(_builtins))
+        safe_modules = frozenset({
+            'builtins', 'builtins.str', 'math', 'sys', 'os', 'collections',
+            'itertools', 're', 'functools', 'datetime', 'json', 'random',
+            'typing', 'subprocess', 'time', '__main__',
+        }) | _builtin_names
 
         if module == '__main__':
             if (method not in KNOWN_OBJECT_METHODS

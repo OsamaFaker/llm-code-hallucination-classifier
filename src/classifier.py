@@ -28,6 +28,8 @@ from src.logic_checker import LogicCheckerPlugin
 from src.attribute_checker import AttributeCheckerPlugin
 from src.arity_checker import ArityCheckerPlugin
 from src.checkers.signature_checker import SignatureCheckerPlugin
+from src.checkers.function_name_checker import FunctionNameCheckerPlugin
+from src.checkers.type_checker import TypeCheckerPlugin
 from src.control_flow import analyze_control_flow
 from src.cache import ASTCache
 from src.profiler import LatencyProfiler
@@ -75,6 +77,8 @@ class CodeClassifier:
         self.registry.register(ArityCheckerPlugin())         # priority 75 (Fix #3)
         self.registry.register(SignatureCheckerPlugin())     # priority 72
         self.registry.register(MisuseCheckerPlugin())        # priority 70
+        self.registry.register(TypeCheckerPlugin())           # priority 68
+        self.registry.register(FunctionNameCheckerPlugin())  # priority 65
         self.registry.register(LogicCheckerPlugin())         # priority 60
 
         if disabled_checkers:
@@ -117,6 +121,77 @@ class CodeClassifier:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def classify_with_oracle(
+        self,
+        sample: CodeSample,
+        test_assertions: str,
+        timeout: int = 5,
+    ) -> ClassificationResult:
+        """
+        Full pipeline + oracle execution post-verification.
+
+        Runs static + LLM classification first.  If the result is VALID and
+        test_assertions are provided, executes the code against those assertions
+        in a subprocess.  Execution failures override the VALID verdict:
+
+          AssertionError / wrong output  → GROUNDED_ERROR
+          ModuleNotFoundError            → HALLUCINATION (fabricated import)
+          AttributeError                 → HALLUCINATION (fabricated attribute)
+          TypeError "unexpected kwarg"   → HALLUCINATION (fabricated parameter)
+          Any other exception            → GROUNDED_ERROR
+
+        This catches the two dominant false-negative classes:
+          1. Hallucinations that passed static + LLM (fabricated methods on
+             user-defined objects, subtle API fabrications)
+          2. Grounded errors that are indistinguishable from valid code
+             statically but fail at runtime (wrong algorithm, type mismatch)
+        """
+        result = self.classify(sample)
+
+        if not result.is_valid or not test_assertions:
+            return result
+
+        from src.oracle_executor import (
+            execute_code,
+            LABEL_VALID,
+            LABEL_HALLUCINATION,
+            LABEL_GROUNDED_ERROR,
+        )
+
+        exec_label, error_msg, exc_type = execute_code(
+            sample.generated_code, test_assertions, timeout=timeout
+        )
+
+        if exec_label == LABEL_VALID:
+            return result  # Confirmed valid — no change
+
+        # Execution contradicts the VALID verdict — override.
+        result.oracle_exec_label = exec_label
+        result.oracle_exec_error = error_msg
+
+        if exec_label == LABEL_HALLUCINATION:
+            result.is_valid = False
+            result.is_grounded_error = False
+            result.hallucination_category = HallucinationCategory.FUNCTION
+            result.checker_source = "oracle_exec"
+            result.explanation = (
+                f"Oracle execution revealed hallucination "
+                f"({exc_type}: {error_msg[:120]})"
+            )
+        else:  # GROUNDED_ERROR
+            result.is_valid = False
+            result.is_grounded_error = True
+            result.hallucination_category = None
+            result.checker_source = "oracle_exec"
+            result.explanation = (
+                f"Oracle execution revealed grounded error "
+                f"({exc_type or 'AssertionError'}: {error_msg[:120]})"
+            )
+
+        exp = result.explanation
+        result.short_explanation = (exp[:97] + "...") if len(exp) > 100 else exp
+        return result
+
     def classify(self, sample: CodeSample) -> ClassificationResult:
         """Classify a code sample through the plugin pipeline."""
         with self.profiler.measure_sample() as elapsed:

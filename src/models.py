@@ -43,6 +43,8 @@ class ClassificationResult:
     taxonomy_tag: Optional[str] = None
     malformed_json: Optional[bool] = None
     short_explanation: Optional[str] = None
+    oracle_exec_label: Optional[str] = None   # set by classify_with_oracle()
+    oracle_exec_error: Optional[str] = None   # set by classify_with_oracle()
 
     def __post_init__(self):
         """Auto-assign severity based on classification if not explicitly set."""

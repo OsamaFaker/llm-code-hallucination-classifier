@@ -189,9 +189,29 @@ class GroundTruthRegistry:
                 params = self._extract_params(obj)
                 functions[name] = {"params": params}
             elif inspect.isclass(obj):
-                # Also introspect class constructors
+                # Capture constructor params under the class name itself
                 params = self._extract_params(obj.__init__) if hasattr(obj, '__init__') else []
                 functions[name] = {"params": params}
+                # Also register all public instance/class methods under
+                # "module.ClassName" so fabrication checks can verify e.g.
+                # pathlib.Path.read_text or collections.Counter.most_common.
+                class_key = f"{module_name}.{name}"
+                if class_key not in self._introspected_modules:
+                    self._introspected_modules.add(class_key)
+                    class_methods = {}
+                    for mname, mobj in inspect.getmembers(obj):
+                        if mname.startswith("_"):
+                            continue
+                        if callable(mobj) or isinstance(mobj, property):
+                            mparams = self._extract_params(mobj) if callable(mobj) else []
+                            class_methods[mname] = {"params": mparams}
+                    if class_methods:
+                        if class_key in self.registry:
+                            existing_cls = self.registry[class_key].get("functions", {})
+                            existing_cls.update(class_methods)
+                            self.registry[class_key]["functions"] = existing_cls
+                        else:
+                            self.registry[class_key] = {"functions": class_methods}
 
         if functions:
             if module_name in self.registry:
