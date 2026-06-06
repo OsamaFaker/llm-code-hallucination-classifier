@@ -149,6 +149,18 @@ def parse_args() -> argparse.Namespace:
             "Default: dataset_v4_500_unclassified.json"
         ),
     )
+    parser.add_argument(
+        "--use-cov",
+        action="store_true",
+        default=False,
+        help="Enable Chain-of-Verification 3-way prompt instead of binary YES/NO verifier.",
+    )
+    parser.add_argument(
+        "--use-selfcheck",
+        action="store_true",
+        default=False,
+        help="Enable SelfCheckGPT multi-temperature consistency check (requires --use-cov).",
+    )
     return parser.parse_args()
 
 
@@ -269,6 +281,8 @@ def run() -> None:
         gt_version="v1",
         use_dynamic_gt=True,
         enable_cache=False,
+        use_cov=args.use_cov,
+        use_selfcheck=args.use_selfcheck,
     )
 
     if not classifier._llm_verifier:

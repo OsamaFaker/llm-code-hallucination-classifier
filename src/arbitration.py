@@ -52,3 +52,49 @@ def arbitrate(
         
     # Fallback for unexpected attempts_task values
     return "VALID", None, static_confidence
+
+
+def arbitrate_cov(
+    static_verdict: str,
+    static_confidence: float,
+    cov_verdict: str,
+    cov_confidence: float,
+    cov_fabricated: bool = False,
+    rescue_threshold: float = 0.92,
+) -> Tuple[str, Optional[str], float]:
+    """
+    Arbitrate between the static pipeline and a CoV 3-way verdict.
+
+    Used when the static checker and CoV disagree.  The static checker
+    has higher precision for clear fabrications; CoV has higher recall
+    for the GROUNDED_ERROR / HALLUCINATION boundary.
+
+    Static HALLUCINATION at high confidence → keep (static is authoritative).
+    Static HALLUCINATION at low confidence  → allow CoV to rescue to GROUNDED_ERROR.
+    Static VALID                            → CoV 3-way verdict is authoritative.
+    Static GROUNDED_ERROR                  → keep (no LLM upgrade to VALID).
+    """
+    if static_verdict == "GROUNDED_ERROR":
+        return "GROUNDED_ERROR", None, static_confidence
+
+    if static_verdict == "HALLUCINATION":
+        if static_confidence >= rescue_threshold:
+            # Static checker is very confident: fabrication evidence is strong.
+            return "HALLUCINATION", None, static_confidence
+        # Low-confidence static HALLUCINATION: let CoV adjudicate.
+        if cov_verdict == "GROUNDED_ERROR" and not cov_fabricated:
+            combined = min(static_confidence, cov_confidence)
+            return "GROUNDED_ERROR", "cov_rescue", combined
+        # CoV agrees it's a hallucination, or CoV returned VALID (unlikely rescue).
+        return "HALLUCINATION", None, min(static_confidence, cov_confidence)
+
+    # static_verdict == "VALID": CoV has the final say.
+    combined = min(static_confidence, cov_confidence)
+    if cov_verdict == "VALID":
+        return "VALID", "cov_valid", combined
+    if cov_verdict == "HALLUCINATION":
+        return "HALLUCINATION", "cov_hallucination", combined
+    if cov_verdict == "GROUNDED_ERROR":
+        return "GROUNDED_ERROR", "cov_grounded_error", combined
+
+    return "VALID", None, static_confidence

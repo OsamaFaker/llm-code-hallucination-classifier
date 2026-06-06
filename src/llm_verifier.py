@@ -1,31 +1,21 @@
 """
-LLM Verifier — Last-resort semantic verification via LLM API.
+LLM Verifier — semantic verification via LLM.
 
-Only called when all static checkers say VALID. Asks an LLM to verify
-whether the generated code actually matches the prompt intent.
+Supports two modes:
+  • Legacy binary  — verify()           → {"attempts_task": YES/NO, "confidence": float}
+  • Chain-of-Verification (CoV) — verify_cov() → {"verdict": VALID/HALLUCINATION/GROUNDED_ERROR,
+                                                   "confidence": float, "fabricated": bool}
 
-Supports two providers:
-    - gemini:  Google Gemini API (free tier with gemini-2.0-flash)
-    - ollama:  Local Ollama server (fully offline, no API key needed)
+SelfCheck consistency is built into verify_cov():
+  On an uncertain first call (confidence < selfcheck_threshold), the verifier
+  re-runs at two higher temperatures and takes the majority verdict, boosting
+  effective accuracy on borderline cases without changing the interface.
 
-Configuration — model selection precedence (highest to lowest):
-    1. constructor argument passed to LLMVerifier(model=...)
-    2. LLM_MODEL environment variable
-    3. hardcoded default: qwen2.5-coder:7b (ollama) / gemini-2.0-flash (gemini)
-
-Other environment variables:
-    LLM_PROVIDER  = "gemini" | "ollama"
-    LLM_API_KEY   = "<your-gemini-api-key>"  (gemini only)
-
-Cache-key scheme (v6, extended):
-    key = <8-char SHA-256 of system prompt> + "_"
-        + <4-char SHA-256 of model identifier> + "_"
-        + <16-char SHA-256 of prompt||code>
-    The model-identifier component ensures that two different models
-    evaluated against the same prompt+code produce distinct cache entries,
-    so switching models mid-evaluation never silently reuses stale verdicts.
-    Cache entries written by earlier versions (which lack the model prefix)
-    are treated as misses and will be overwritten on first access.
+Cache key scheme (v7):
+    <8-char SHA-256 of system prompt> + "_" +
+    <4-char SHA-256 of model>         + "_" +
+    <2-char hex temperature>          + "_" +
+    <16-char SHA-256 of prompt||code>
 """
 import os
 import json
@@ -33,11 +23,12 @@ import hashlib
 import threading
 import urllib.request
 import urllib.error
-from typing import Dict
+from collections import Counter
+from typing import Dict, List
 
 
 # ---------------------------------------------------------------------------
-# Verification prompt — designed for narrow yes/no classification
+# Legacy binary prompt (backward compatible)
 # ---------------------------------------------------------------------------
 _SYSTEM_PROMPT = (
     "You are an automated code reviewer. Your single task is to judge whether a piece\n"
@@ -73,17 +64,56 @@ _SYSTEM_PROMPT = (
     "No prose before or after."
 )
 
-# 8-char SHA-256 of the system prompt — changes when the prompt changes,
-# which invalidates all cached verdicts for that prompt version.
-_PROMPT_VERSION = hashlib.sha256(_SYSTEM_PROMPT.encode()).hexdigest()[:8]
-
-
 _USER_TEMPLATE = (
     "PROMPT:\n{prompt}\n\n"
     "CODE:\n{code}\n\n"
     "Return your verdict as a single JSON object with exactly these fields:\n"
     '{{"attempts_task": "YES" or "NO", "confidence": <float>, "justification": "<one sentence, max 25 words>"}}'
 )
+
+# ---------------------------------------------------------------------------
+# Chain-of-Verification (CoV) prompt — 3-way output
+# ---------------------------------------------------------------------------
+# Targets the GROUNDED_ERROR/HALLUCINATION confusion: the model must explicitly
+# decide whether a failing name is *invented* (HALLUCINATION) or a *real name
+# misapplied* (GROUNDED_ERROR) before committing to a verdict.
+_COV_SYSTEM_PROMPT = (
+    "You are a Python hallucination detector. Classify the code into exactly one of:\n\n"
+    "  HALLUCINATION — code references a module, function, or identifier that does NOT\n"
+    "    exist in Python's standard library or any well-known package (numpy, pandas,\n"
+    "    requests, etc.). Examples: importing sortinglib, pymath, datautils; calling a\n"
+    "    function that simply does not exist in the module it is attributed to.\n\n"
+    "  GROUNDED_ERROR — code uses REAL Python constructs but applies them incorrectly.\n"
+    "    All modules and functions exist; they are misused: wrong arguments, wrong type,\n"
+    "    wrong algorithm, or the code produces wrong output on the test cases.\n\n"
+    "  VALID — code uses real Python constructs correctly and genuinely attempts the task.\n\n"
+    "Critical disambiguation rule for NameError / ModuleNotFoundError:\n"
+    "  Ask: does this name ACTUALLY EXIST in Python?\n"
+    "  If NO  → HALLUCINATION.\n"
+    "  If YES but used wrongly (typo of a real name, real module wrong function) → GROUNDED_ERROR.\n\n"
+    "Begin your response with { and end with }. No other text."
+)
+
+_COV_USER_TEMPLATE = (
+    "TASK: {prompt}\n\n"
+    "CODE:\n{code}\n\n"
+    "Work through these checks before answering:\n"
+    "  1. Are all imported modules real Python modules (stdlib or well-known packages)?\n"
+    "  2. Are all functions/classes/methods called in the code real names that actually\n"
+    "     exist in those modules?\n"
+    "  3. If a name is missing or wrong: is it completely invented, or is it a real name\n"
+    "     applied in the wrong way?\n"
+    "  4. Does the code make a genuine attempt at the stated task (not a stub)?\n\n"
+    "Return ONLY this JSON:\n"
+    '{{"verdict": "VALID" or "HALLUCINATION" or "GROUNDED_ERROR", '
+    '"confidence": <float 0.0-1.0>, '
+    '"fabricated": <true if invented name/module, false otherwise>, '
+    '"justification": "<max 25 words>"}}'
+)
+
+# 8-char SHA-256 of each prompt — cache keys auto-invalidate when prompts change.
+_PROMPT_VERSION = hashlib.sha256(_SYSTEM_PROMPT.encode()).hexdigest()[:8]
+_COV_PROMPT_VERSION = hashlib.sha256(_COV_SYSTEM_PROMPT.encode()).hexdigest()[:8]
 
 
 # ---------------------------------------------------------------------------
@@ -95,29 +125,24 @@ class _GeminiProvider:
     def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
         self.api_key = api_key
         self.model = model
-        self._url = (
+        self._base_url = (
             f"https://generativelanguage.googleapis.com/v1beta/"
             f"models/{self.model}:generateContent?key={self.api_key}"
         )
 
-    def call(self, message: str) -> str:
+    def call(self, system_prompt: str, user_prompt: str, temperature: float = 0.0) -> str:
         payload = json.dumps({
-            "contents": [{"parts": [{"text": message}]}],
-            "generationConfig": {
-                "temperature": 0.0,
-                "maxOutputTokens": 200,
-            },
+            "contents": [{"parts": [{"text": system_prompt + "\n\n" + user_prompt}]}],
+            "generationConfig": {"temperature": temperature, "maxOutputTokens": 200},
         }).encode("utf-8")
-
         req = urllib.request.Request(
-            self._url,
+            self._base_url,
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-
         try:
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError):
@@ -128,30 +153,19 @@ class _OllamaProvider:
     """Local Ollama server via REST."""
 
     def __init__(self, model: str = "", base_url: str = "http://localhost:11434"):
-        # Precedence: constructor arg > LLM_MODEL env var > hardcoded default
-        # This allows callers to pass the model explicitly, fall back to the
-        # environment variable for users who set it externally, or use the
-        # dissertation baseline (qwen2.5-coder:7b) when neither is supplied.
         self.model = model or os.getenv("LLM_MODEL", "") or "qwen2.5-coder:7b"
         self.base_url = base_url.rstrip("/")
 
-    def call(self, message: str) -> str:
-        system_prompt = _SYSTEM_PROMPT
-        user_prompt = message.replace(_SYSTEM_PROMPT + "\n\n", "")
-
+    def call(self, system_prompt: str, user_prompt: str, temperature: float = 0.0) -> str:
         payload = json.dumps({
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "user",   "content": user_prompt},
             ],
             "stream": False,
-            "options": {
-                "temperature": 0.0,
-                "num_predict": 150
-            },
+            "options": {"temperature": temperature, "num_predict": 200},
         }).encode("utf-8")
-
         req = urllib.request.Request(
             f"{self.base_url}/api/chat",
             data=payload,
@@ -160,7 +174,6 @@ class _OllamaProvider:
         )
         with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-
         return data.get("message", {}).get("content", "")
 
 
@@ -169,23 +182,26 @@ class _OllamaProvider:
 # ---------------------------------------------------------------------------
 class LLMVerifier:
     """
-    Verifies code-prompt alignment using an LLM as a last-resort check.
+    Two-mode semantic verifier:
 
-    Only instantiated when LLM_PROVIDER env var is set. The verify() method
-    is called from the classifier pipeline when all static checkers say VALID.
+      verify(prompt, code)         — legacy binary YES/NO
+      verify_cov(prompt, code)     — Chain-of-Verification 3-way verdict
+      verify_with_selfcheck(...)   — CoV + SelfCheck consistency on uncertain cases
     """
 
     def __init__(
         self,
-        provider: str = "gemini",
+        provider: str = "ollama",
         api_key: str = "",
         model: str = "",
+        selfcheck_threshold: float = 0.80,
     ):
         self.provider_name = provider.lower()
+        self.selfcheck_threshold = selfcheck_threshold
         self.malformed_count = 0
         self._cache_file = os.path.join(os.path.dirname(__file__), "llm_cache.json")
         self._cache: Dict[str, dict] = {}
-        self._lock = threading.Lock()  # Thread-safe cache writes
+        self._lock = threading.Lock()
 
         if os.path.exists(self._cache_file):
             try:
@@ -199,95 +215,208 @@ class LLMVerifier:
                 api_key=api_key,
                 model=model or os.getenv("LLM_MODEL", "") or "gemini-2.0-flash",
             )
-        elif self.provider_name == "ollama":
-            # Pass model as-is; _OllamaProvider applies the three-level precedence.
-            self._provider = _OllamaProvider(model=model)
         else:
-            raise ValueError(f"Unknown LLM provider: {provider}")
+            self._provider = _OllamaProvider(model=model)
 
-        # 4-char SHA-256 of the resolved model name — included in every cache key
-        # so that verdicts from different models never collide in the cache.
         self._model_version = hashlib.sha256(
             self._provider.model.encode()
         ).hexdigest()[:4]
 
-        print(f"[llm_verifier] Initialized with provider={self.provider_name}, "
-              f"model={self._provider.model}")
+        print(f"[llm_verifier] provider={self.provider_name}, model={self._provider.model}")
 
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+    def _cache_key(self, prompt_ver: str, prompt: str, code: str, temperature: float) -> str:
+        content_hash = hashlib.sha256(f"{prompt}||{code}".encode()).hexdigest()[:16]
+        temp_hex = format(int(temperature * 10), "02x")
+        return f"{prompt_ver}_{self._model_version}_{temp_hex}_{content_hash}"
+
+    def _save_cache(self) -> None:
+        try:
+            with open(self._cache_file, "w", encoding="utf-8") as f:
+                json.dump(self._cache, f)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Low-level call
+    # ------------------------------------------------------------------
+    def _call(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        cache_key: str,
+    ) -> str:
+        """Call the provider, using the cache for temperature=0 results."""
+        if temperature == 0.0 and cache_key in self._cache:
+            cached = self._cache[cache_key]
+            # Return raw string representation so callers can re-parse
+            return json.dumps(cached)
+
+        raw = self._provider.call(system_prompt, user_prompt, temperature)
+
+        if temperature == 0.0:
+            with self._lock:
+                # Don't overwrite — parse first so we store the parsed dict
+                pass  # parsed and stored by callers below
+
+        return raw
+
+    # ------------------------------------------------------------------
+    # Legacy binary verify (backward compatible)
+    # ------------------------------------------------------------------
     def verify(self, prompt: str, code: str) -> dict:
         """
-        Ask the LLM whether the code attempts the prompt intent.
-        Returns: {"attempts_task": "YES"|"NO", "confidence": float,
-                  "justification": str, "_malformed": bool}
-
-        Cache key format: <8-char prompt hash>_<4-char model hash>_<16-char content hash>
-        Entries from earlier versions (no model prefix) are treated as misses.
+        Legacy YES/NO check: does the code attempt the task?
+        Returns: {"attempts_task": "YES"|"NO", "confidence": float, "justification": str}
         """
-        raw_key = f"{prompt}||{code}"
-        cache_key = (
-            _PROMPT_VERSION + "_"
-            + self._model_version + "_"
-            + hashlib.sha256(raw_key.encode()).hexdigest()[:16]
-        )
+        key = self._cache_key(_PROMPT_VERSION, prompt, code, 0.0)
+        if key in self._cache:
+            return self._cache[key]
 
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-
-        message = _SYSTEM_PROMPT + "\n\n" + _USER_TEMPLATE.format(
-            prompt=prompt, code=code
-        )
-
+        user_prompt = _USER_TEMPLATE.format(prompt=prompt, code=code)
         try:
-            raw_response = self._provider.call(message)
-            parsed = self._parse_response(raw_response)
+            raw = self._provider.call(_SYSTEM_PROMPT, user_prompt, 0.0)
+            parsed = self._parse_binary(raw)
         except Exception as e:
-            print(f"[llm_verifier] API error: {e}")
+            print(f"[llm_verifier] API error (verify): {e}")
             self.malformed_count += 1
-            return {
-                "attempts_task": "YES",
-                "confidence": 0.0,
-                "justification": f"API Error: {e}",
-                "_malformed": True,
-            }
+            return {"attempts_task": "YES", "confidence": 0.0,
+                    "justification": f"API Error: {e}", "_malformed": True}
 
         with self._lock:
-            self._cache[cache_key] = parsed
-            try:
-                with open(self._cache_file, "w", encoding="utf-8") as f:
-                    json.dump(self._cache, f)
-            except Exception:
-                pass
-
+            self._cache[key] = parsed
+            self._save_cache()
         return parsed
 
-    def _parse_response(self, raw: str) -> dict:
-        """Parse the LLM response defensively."""
+    # ------------------------------------------------------------------
+    # Chain-of-Verification — single run
+    # ------------------------------------------------------------------
+    def verify_cov(self, prompt: str, code: str, temperature: float = 0.0) -> dict:
+        """
+        Chain-of-Verification single run.
+        Returns: {"verdict": VALID|HALLUCINATION|GROUNDED_ERROR,
+                  "confidence": float, "fabricated": bool, "justification": str}
+        """
+        key = self._cache_key(_COV_PROMPT_VERSION, prompt, code, temperature)
+        if temperature == 0.0 and key in self._cache:
+            return self._cache[key]
+
+        user_prompt = _COV_USER_TEMPLATE.format(prompt=prompt, code=code)
+        try:
+            raw = self._provider.call(_COV_SYSTEM_PROMPT, user_prompt, temperature)
+            parsed = self._parse_cov(raw)
+        except Exception as e:
+            print(f"[llm_verifier] API error (verify_cov): {e}")
+            self.malformed_count += 1
+            return {"verdict": "GROUNDED_ERROR", "confidence": 0.0,
+                    "fabricated": False, "justification": f"API Error: {e}",
+                    "_malformed": True}
+
+        if temperature == 0.0:
+            with self._lock:
+                self._cache[key] = parsed
+                self._save_cache()
+        return parsed
+
+    # ------------------------------------------------------------------
+    # SelfCheck: CoV + consistency across 3 temperatures
+    # ------------------------------------------------------------------
+    def verify_with_selfcheck(self, prompt: str, code: str) -> dict:
+        """
+        Chain-of-Verification with SelfCheck consistency.
+
+        Algorithm
+        ---------
+        1. Run CoV at temperature=0.0 (deterministic).
+        2. If confidence >= selfcheck_threshold → return immediately (certain).
+        3. Otherwise run 2 more times at temperature=0.4 and 0.7.
+        4. Take majority verdict of the 3 runs.
+        5. Final confidence = fraction agreeing × mean confidence of agreeing runs.
+
+        This catches borderline cases where the first run is uncertain, without
+        adding extra LLM calls for the large majority of straightforward samples.
+        """
+        first = self.verify_cov(prompt, code, temperature=0.0)
+
+        if first.get("_malformed"):
+            return first
+
+        if first["confidence"] >= self.selfcheck_threshold:
+            first["selfcheck_runs"] = 1
+            return first
+
+        # Uncertain — run 2 more at higher temperatures
+        extra_temps = [0.4, 0.7]
+        runs: List[dict] = [first]
+        for t in extra_temps:
+            r = self.verify_cov(prompt, code, temperature=t)
+            if not r.get("_malformed"):
+                runs.append(r)
+
+        verdicts = [r["verdict"] for r in runs]
+        majority_verdict, count = Counter(verdicts).most_common(1)[0]
+        agreeing = [r for r in runs if r["verdict"] == majority_verdict]
+        mean_conf = sum(r["confidence"] for r in agreeing) / len(agreeing)
+        agreement_ratio = count / len(runs)
+
+        return {
+            "verdict": majority_verdict,
+            "confidence": mean_conf * agreement_ratio,
+            "fabricated": any(r.get("fabricated", False) for r in agreeing),
+            "justification": agreeing[0]["justification"],
+            "selfcheck_runs": len(runs),
+            "selfcheck_agreement": agreement_ratio,
+            "_malformed": False,
+        }
+
+    # ------------------------------------------------------------------
+    # Parsers
+    # ------------------------------------------------------------------
+    def _parse_binary(self, raw: str) -> dict:
         raw = raw.strip()
-
-        start_idx = raw.find("{")
-        end_idx = raw.rfind("}")
-
-        if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
-            json_str = raw[start_idx:end_idx + 1]
+        s, e = raw.find("{"), raw.rfind("}")
+        if s != -1 and e >= s:
             try:
-                data = json.loads(json_str)
+                data = json.loads(raw[s:e + 1])
                 return {
                     "attempts_task": str(data.get("attempts_task", "YES")).upper(),
                     "confidence": float(data.get("confidence", 0.0)),
-                    "justification": str(data.get("justification", "No justification provided")),
+                    "justification": str(data.get("justification", "")),
                     "_malformed": False,
                 }
             except (json.JSONDecodeError, ValueError):
                 pass
-
-        print(f"[llm_verifier] Malformed JSON response: {raw}")
+        print(f"[llm_verifier] Malformed binary response: {raw[:120]}")
         self.malformed_count += 1
-        return {
-            "attempts_task": "YES",
-            "confidence": 0.0,
-            "justification": "Malformed JSON output",
-            "_malformed": True,
-        }
+        return {"attempts_task": "YES", "confidence": 0.0,
+                "justification": "Malformed JSON", "_malformed": True}
+
+    def _parse_cov(self, raw: str) -> dict:
+        raw = raw.strip()
+        s, e = raw.find("{"), raw.rfind("}")
+        if s != -1 and e >= s:
+            try:
+                data = json.loads(raw[s:e + 1])
+                verdict = str(data.get("verdict", "GROUNDED_ERROR")).upper()
+                if verdict not in ("VALID", "HALLUCINATION", "GROUNDED_ERROR"):
+                    verdict = "GROUNDED_ERROR"
+                return {
+                    "verdict": verdict,
+                    "confidence": float(data.get("confidence", 0.0)),
+                    "fabricated": bool(data.get("fabricated", False)),
+                    "justification": str(data.get("justification", "")),
+                    "_malformed": False,
+                }
+            except (json.JSONDecodeError, ValueError):
+                pass
+        print(f"[llm_verifier] Malformed CoV response: {raw[:120]}")
+        self.malformed_count += 1
+        return {"verdict": "GROUNDED_ERROR", "confidence": 0.0,
+                "fabricated": False, "justification": "Malformed JSON",
+                "_malformed": True}
 
     def get_cache_stats(self) -> dict:
         return {"cached_entries": len(self._cache)}

@@ -33,7 +33,6 @@ from src.checkers.type_checker import TypeCheckerPlugin
 from src.control_flow import analyze_control_flow
 from src.cache import ASTCache
 from src.profiler import LatencyProfiler
-from src.confidence_calibrator import ConfidenceCalibrator
 
 from src.arbitration import arbitrate
 
@@ -59,8 +58,14 @@ class CodeClassifier:
         enable_cache: bool = True,
         enable_calibration: bool = True,
         language: str = "python",
+        use_cov: bool = False,
+        use_selfcheck: bool = False,
+        cov_rescue_threshold: float = 0.80,
     ):
         self.language = language.lower()
+        self.use_cov = use_cov
+        self.use_selfcheck = use_selfcheck
+        self.cov_rescue_threshold = cov_rescue_threshold
         self.gt = GroundTruthRegistry(version=gt_version, use_dynamic=use_dynamic_gt)
         self.ast_cache = ASTCache() if enable_cache else None
         self.profiler = LatencyProfiler(enabled=enable_profiling)
@@ -290,22 +295,109 @@ class CodeClassifier:
         return result
 
     def verify_semantic(self, sample: CodeSample, static_res: ClassificationResult) -> ClassificationResult:
-        """Runs LLM Verifier (if needed) and Arbitration Table."""
+        """Runs LLM Verifier (if needed) and Arbitration Table.
+
+        CoV mode (use_cov=True):
+          • When static says VALID    → CoV 3-way verdict replaces binary YES/NO.
+          • When static says HALLUCINATION with confidence < cov_rescue_threshold
+            → CoV double-checks; may rescue to GROUNDED_ERROR when the static
+            checker was too aggressive (the main source of false positives).
+
+        SelfCheck mode (use_selfcheck=True):
+          • CoV runs 3× on uncertain samples (confidence < 0.80), taking majority.
+        """
         code = sample.generated_code
         prompt = sample.prompt
-        
+
         static_verdict = "VALID"
         if not static_res.is_valid:
             static_verdict = "GROUNDED_ERROR" if static_res.is_grounded_error else "HALLUCINATION"
-        
+
         static_confidence = static_res.confidence
-        
+        malformed_json = False
+
+        # ------------------------------------------------------------------
+        # CoV path
+        # ------------------------------------------------------------------
+        if self.use_cov and self._llm_verifier:
+            run_cov = False
+            rescue_attempt = False
+
+            if static_verdict == "VALID":
+                run_cov = True
+            elif (static_verdict == "HALLUCINATION"
+                  and static_confidence < self.cov_rescue_threshold):
+                # Static checker fired but wasn't confident — verify whether
+                # the failing construct is truly invented or just misapplied.
+                run_cov = True
+                rescue_attempt = True
+
+            if run_cov:
+                if self.use_selfcheck and not rescue_attempt:
+                    # SelfCheck (multi-temp majority vote) only for VALID path.
+                    # Rescue uses a single CoV call — one extra call is enough
+                    # to resolve HALLUCINATION vs GROUNDED_ERROR ambiguity.
+                    cov = self._llm_verifier.verify_with_selfcheck(prompt, code)
+                else:
+                    cov = self._llm_verifier.verify_cov(prompt, code)
+
+                malformed_json = cov.get("_malformed", False)
+                cov_verdict = cov["verdict"]
+                cov_conf = cov["confidence"]
+                justification = cov.get("justification", "")
+
+                if rescue_attempt:
+                    # Only override static HALLUCINATION → GROUNDED_ERROR.
+                    # Never upgrade to VALID from a rescue (static evidence too strong).
+                    if cov_verdict == "GROUNDED_ERROR" and not cov.get("fabricated", True):
+                        static_res.is_grounded_error = True
+                        static_res.hallucination_category = None
+                        static_res.checker_source = "cov_rescue"
+                        static_res.explanation = (
+                            f"CoV rescued static HALLUCINATION → GROUNDED_ERROR: {justification}"
+                        )
+                        static_res.confidence = min(static_confidence, cov_conf)
+                        static_res.verifier_justification = justification
+                        static_res.malformed_json = malformed_json
+                        return static_res
+                    # Otherwise keep the static HALLUCINATION verdict unchanged.
+                    return static_res
+
+                # Static said VALID — accept CoV's 3-way verdict.
+                final_result = static_res
+                final_result.verifier_justification = justification
+                final_result.malformed_json = malformed_json
+                final_result.verifier_confidence = cov_conf
+
+                if cov_verdict == "VALID":
+                    final_result.is_valid = True
+                    final_result.is_grounded_error = False
+                    final_result.hallucination_category = None
+                    final_result.checker_source = "cov_verifier"
+                elif cov_verdict == "HALLUCINATION":
+                    final_result.is_valid = False
+                    final_result.is_grounded_error = False
+                    final_result.hallucination_category = HallucinationCategory.SEMANTIC
+                    final_result.checker_source = "cov_verifier"
+                    final_result.explanation += f" CoV: {justification}"
+                elif cov_verdict == "GROUNDED_ERROR":
+                    final_result.is_valid = False
+                    final_result.is_grounded_error = True
+                    final_result.hallucination_category = None
+                    final_result.checker_source = "cov_verifier"
+                    final_result.explanation += f" CoV: {justification}"
+
+                final_result.confidence = min(static_confidence, cov_conf) if cov_conf > 0 else static_confidence
+                final_result.taxonomy_tag = f"cov_{cov_verdict.lower()}"
+                return final_result
+
+        # ------------------------------------------------------------------
+        # Legacy binary path (use_cov=False)
+        # ------------------------------------------------------------------
         attempts_task = "NOT_RUN"
         verifier_confidence = 1.0
         verifier_justification = None
-        malformed_json = False
 
-        # Run LLM Verifier only if static says VALID
         if static_verdict == "VALID" and self._llm_verifier:
             llm_res = self._llm_verifier.verify(prompt, code)
             attempts_task = llm_res.get("attempts_task", "YES")
@@ -322,7 +414,6 @@ class CodeClassifier:
             final_result.attempts_task = attempts_task
             final_result.verifier_confidence = verifier_confidence
             final_result.verifier_justification = verifier_justification
-            
             if attempts_task == "NO":
                 final_result.is_valid = False
                 final_result.explanation += f" Semantic Hallucination [LLM Verified]: {verifier_justification}"
@@ -349,7 +440,6 @@ class CodeClassifier:
         final_result.confidence = combined_confidence
         final_result.taxonomy_tag = taxonomy_tag
         final_result.malformed_json = malformed_json
-        
         return final_result
 
     # ------------------------------------------------------------------

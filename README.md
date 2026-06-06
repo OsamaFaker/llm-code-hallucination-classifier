@@ -115,8 +115,11 @@ results/mbpp_oracle_450_balanced_llama3_results.json
 ## Results
 
 Evaluated on the 450-sample balanced oracle dataset (150 per class).
+Two pipeline variants are reported: **Baseline** (static funnel + binary LLM verifier) and **Enhanced** (static funnel + Chain-of-Verification 3-way verifier).
 
-### Qwen 2.5 Coder 7B
+### Baseline
+
+#### Qwen 2.5 Coder 7B — baseline
 
 **Overall accuracy: 0.907 · Macro F1: 0.907**
 
@@ -135,7 +138,7 @@ TRUE GROUNDED_ERROR    0              120              30
 TRUE HALLUCINATION     0                0             150
 ```
 
-### Llama 3 8B
+#### Llama 3 8B — baseline
 
 **Overall accuracy: 0.938 · Macro F1: 0.938**
 
@@ -154,26 +157,69 @@ TRUE GROUNDED_ERROR    0              131              19
 TRUE HALLUCINATION     0                0             150
 ```
 
-*Results file:* `results/mbpp_oracle_450_llama3_results.json`
+---
 
-### Model comparison
+### Enhanced (+ Chain-of-Verification)
 
-| Metric | Qwen 2.5 Coder 7B | Llama 3 8B |
+Run with `--use-cov`.  The CoV verifier replaces the binary YES/NO LLM check with a structured 3-way verdict (VALID / HALLUCINATION / GROUNDED_ERROR) and an explicit disambiguation rule for NameError/AttributeError cases.
+
+#### Qwen 2.5 Coder 7B — enhanced
+
+**Overall accuracy: 0.938 · Macro F1: 0.938**
+
+| Class | Precision | Recall | F1 |
+|---|---|---|---|
+| VALID | 1.000 | 0.940 | 0.969 |
+| GROUNDED_ERROR | 0.963 | 0.873 | 0.916 |
+| HALLUCINATION | 0.867 | 1.000 | 0.929 |
+
+Confusion matrix (rows = true label, columns = predicted):
+
+```
+                   VALID   GROUNDED_ERROR   HALLUCINATION
+TRUE VALID           141                5               4
+TRUE GROUNDED_ERROR    0              131              19
+TRUE HALLUCINATION     0                0             150
+```
+
+#### Llama 3 8B — enhanced
+
+**Overall accuracy: 0.938 · Macro F1: 0.938** *(identical to baseline)*
+
+Llama 3's binary verifier was already maximally lenient (never issued a NO verdict), so the CoV 3-way output produces the same predictions.  No regression; cross-model agreement is 100%.
+
+---
+
+### Full comparison table
+
+| Model | Pipeline | Accuracy | Macro F1 | GE Recall | HALL Precision |
+|---|---|---|---|---|---|
+| Qwen 2.5 Coder 7B | Baseline | 0.907 | 0.907 | 0.800 | 0.802 |
+| **Qwen 2.5 Coder 7B** | **Enhanced (+CoV)** | **0.938** | **0.938** | **0.873** | **0.867** |
+| Llama 3 8B | Baseline | 0.938 | 0.938 | 0.873 | 0.867 |
+| Llama 3 8B | Enhanced (+CoV) | 0.938 | 0.938 | 0.873 | 0.867 |
+
+*GE = GROUNDED_ERROR, HALL = HALLUCINATION*
+
+### What CoV fixes
+
+CoV made **14 correct prediction changes** for Qwen (all improvements, zero regressions):
+
+| Change | Count | Mechanism |
 |---|---|---|
-| Overall accuracy | 0.907 | **0.938** |
-| Macro F1 | 0.907 | **0.938** |
-| VALID F1 | 0.958 | **0.969** |
-| GROUNDED_ERROR F1 | 0.873 | **0.916** |
-| HALLUCINATION F1 | 0.890 | **0.929** |
-| HALLUCINATION recall | 1.000 | 1.000 |
-| VALID precision | 1.000 | 1.000 |
+| HALLUCINATION → GROUNDED\_ERROR | 9 | CoV 3-way verdict distinguishes real-but-misused from fabricated |
+| HALLUCINATION → GROUNDED\_ERROR | 2 | CoV said VALID; oracle post-verify confirmed GROUNDED\_ERROR |
+| HALLUCINATION → VALID | 3 | CoV cleared cases the binary verifier wrongly rejected |
+
+The main target was the **GROUNDED\_ERROR → HALLUCINATION confusion** (the hardest boundary in the taxonomy): reduced from 30 cases to 19.
 
 ### Key observations
 
 - **Both models achieve 100% HALLUCINATION recall** — the pipeline never misses a hallucination
-- **Both models achieve 100% VALID precision** — when either calls a sample VALID, it truly passes all tests
-- **Llama 3 outperforms Qwen** on this balanced dataset: 93.8% vs 90.7% accuracy
-- **Main confusion in both models**: GROUNDED_ERROR samples over-called as HALLUCINATION (the hardest boundary in the taxonomy) — 30 cases for Qwen, 19 for Llama 3
+- **Both models achieve 100% VALID precision** — a VALID prediction always passes all tests
+- **CoV brings Qwen to Llama 3's level**: +3.1% accuracy, closing the gap entirely
+- **Cross-model agreement is 100%** after enhancement — predictions are model-agnostic
+- **CoV is model-dependent**: it only helps Qwen because Llama 3's verifier was already lenient; using CoV with Llama 3 adds latency with no accuracy gain
 - The old 60-sample dataset (85% HALLUCINATION skew) reported a misleading 95% accuracy; the **balanced 450-sample evaluation gives a more honest picture**
 
 ---
@@ -197,6 +243,20 @@ Each entry in the classified JSON files contains the original sample fields plus
 
 | Script | Purpose |
 |---|---|
-| `scripts/classify.py` | Run the classifier on a dataset |
+| `scripts/classify.py` | Run the baseline classifier; add `--use-cov` for Chain-of-Verification |
+| `scripts/classify_enhanced.py` | Run with all improvements pre-enabled (CoV + SelfCheck) |
+| `scripts/calibrate.py` | Fit Platt-scaling calibrators from existing results → `src/calibrators.json` |
+| `scripts/evaluate.py` | Compute accuracy, F1, confusion matrix; compare two result files |
 | `scripts/generate_oracle_dataset.py` | Build a new execution-oracle dataset from MBPP |
-| `harness.py` | Low-level evaluation harness (called by `classify.py`) |
+| `harness.py` | Evaluation harness called by all classify scripts |
+
+### classify.py flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--input PATH` | built-in default | Input dataset JSON |
+| `--model` | `qwen` | Verifier model: `qwen` or `llama3` |
+| `--output PATH` | auto | Override output path |
+| `--workers N` | `3` | Parallel LLM-verifier workers |
+| `--use-cov` | off | Enable Chain-of-Verification 3-way prompt |
+| `--use-selfcheck` | off | Enable multi-temperature consistency check (requires `--use-cov`; slow on local hardware) |

@@ -1,0 +1,11 @@
+{
+  "model_a": "mbpp_oracle_450_balanced_qwen_enhanced_results.json",
+  "model_b": "mbpp_oracle_450_balanced_llama3_enhanced_results.json",
+  "total": 450,
+  "agree": 450,
+  "disagree": 0,
+  "model_a_wins": 0,
+  "model_b_wins": 0,
+  "both_wrong": 0,
+  "disagreements": []
+}
