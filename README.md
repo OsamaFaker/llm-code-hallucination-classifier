@@ -42,7 +42,7 @@ Each sample's ground-truth label is determined by actually executing the code ag
 | Problems used | 164 (early-stop once all classes hit 150 samples) |
 | Total samples | **450** |
 | Label balance | **150 VALID · 150 HALLUCINATION · 150 GROUNDED_ERROR (33% each)** |
-| File | `results/dataset_oracle_974p_balanced150.json` |
+| File | `results/mbpp_oracle_450_balanced.json` |
 
 ### Generating the dataset yourself
 
@@ -54,7 +54,7 @@ python scripts/generate_oracle_dataset.py \
   --max-each 150 \
   --balance \
   --target-each 150 \
-  --output results/dataset_oracle_974p_balanced150.json
+  --output results/mbpp_oracle_450_balanced.json
 ```
 
 | Flag | Description |
@@ -84,21 +84,21 @@ ollama pull llama3:latest
 
 ```bash
 # Qwen 2.5 Coder (default)
-python scripts/classify_v6.py \
-  --input results/dataset_oracle_974p_balanced150.json \
+python scripts/classify.py \
+  --input results/mbpp_oracle_450_balanced.json \
   --model qwen
 
 # Llama 3
-python scripts/classify_v6.py \
-  --input results/dataset_oracle_974p_balanced150.json \
+python scripts/classify.py \
+  --input results/mbpp_oracle_450_balanced.json \
   --model llama3
 ```
 
 Output is written to `results/` named after the input file and model:
 
 ```
-results/dataset_oracle_974p_balanced150_classified_v6_qwen.json
-results/dataset_oracle_974p_balanced150_classified_v6_llama3.json
+results/mbpp_oracle_450_balanced_qwen_results.json
+results/mbpp_oracle_450_balanced_llama3_results.json
 ```
 
 ### Flags
@@ -137,7 +137,7 @@ TRUE HALLUCINATION     0                0             150
 
 ### Llama 3 8B
 
-*Results file:* `results/dataset_oracle_974p_balanced150_classified_v6_llama3.json`
+*Results file:* `results/mbpp_oracle_450_llama3_results.json`
 
 > Results will be added here once the run completes.
 
@@ -169,6 +169,6 @@ Each entry in the classified JSON files contains the original sample fields plus
 
 | Script | Purpose |
 |---|---|
-| `scripts/classify_v6.py` | Run the classifier on a dataset |
+| `scripts/classify.py` | Run the classifier on a dataset |
 | `scripts/generate_oracle_dataset.py` | Build a new execution-oracle dataset from MBPP |
-| `classify_unclassified_v6.py` | Low-level harness (called by `classify_v6.py`) |
+| `harness.py` | Low-level evaluation harness (called by `classify.py`) |
