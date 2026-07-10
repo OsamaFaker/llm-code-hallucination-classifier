@@ -1,4 +1,4 @@
-# LLM Code Hallucination Classifier
+# Code-Hallucination-Classifier Prototype
 
 A static-plus-LLM pipeline that detects hallucinations in LLM-generated Python code.
 Each code snippet is classified into one of three ground-truth labels:
